@@ -1,27 +1,27 @@
 # supabase-audit
 
-Supabase の外部公開 API 面（主に PostgREST / Storage）を簡易チェックするシェルスクリプトです。  
-`anon` キーや `noauth` でアクセス可否を確認し、公開しすぎの兆候を検出します。
+`supabase-audit` is a shell script for checking external exposure on Supabase Data API surfaces (mainly PostgREST and Storage).
+It validates access behavior for `anon` and optional `noauth` paths to detect overexposed endpoints.
 
-## できること
+## What it does
 
-- テーブル/ビューの read 可否チェック
-- OpenAPI からのテーブル/ビュー 自動検出（`--auto-tables`）
-- `noauth / anon / user` のアクセス比較（`--auth-matrix`）
-- Storage バケット列挙と list 可否チェック（`--storage-probe`）
-- 検知結果の JSON 出力（`--report-json`）
-- High finding 検知時に CI を fail（`--strict`）
-- レート制御（`--sleep-ms`）
+- Checks table/view read accessibility
+- Auto-discovers table/view targets from `/rest/v1/` OpenAPI (`--auto-tables`)
+- Compares access as `noauth / anon / user` (`--auth-matrix`)
+- Probes Storage bucket listing permissions (`--storage-probe`)
+- Writes machine-readable JSON reports (`--report-json`)
+- Fails CI on high-severity findings (`--strict`)
+- Supports probe throttling (`--sleep-ms`, default: `200`)
 
-## 必要環境
+## Requirements
 
 - Bash
 - `curl`
 - `jq`
 
-## クイックスタート
+## Quick start
 
-### 1. テーブル一覧ファイルで実行
+### 1. Manual table list
 
 ```bash
 SUPABASE_URL=https://xxx.supabase.co \
@@ -29,7 +29,7 @@ SUPABASE_ANON_KEY=xxx \
 ./sb-audit.sh --tables tables.txt
 ```
 
-### 2. 自動検出で実行
+### 2. Auto-discovery
 
 ```bash
 SUPABASE_URL=https://xxx.supabase.co \
@@ -37,7 +37,7 @@ SUPABASE_ANON_KEY=xxx \
 ./sb-audit.sh --auto-tables --noauth-probe
 ```
 
-### 3. 拡張チェック + CI 向け
+### 3. CI-oriented run
 
 ```bash
 SUPABASE_URL=https://xxx.supabase.co \
@@ -48,36 +48,37 @@ SUPABASE_USER_JWT=xxx \
   --strict --report-json report.json
 ```
 
-## 主なオプション
+## Main options
 
-- `--tables <file>`: テーブル名リスト（1行1件）
-- `--auto-tables`: `/rest/v1/` OpenAPI から table/view を抽出
-- `--noauth-probe`: ヘッダなしアクセスの read チェック
-- `--auth-matrix`: `noauth / anon / user` を比較表示
-- `--user-jwt <jwt>`: `--auth-matrix` の user 用 JWT
-- `--storage-probe`: 各バケットへの object list 試行
-- `--sample-read`: 1行サンプルを取得してキー名を表示（本番は非推奨）
-- `--sleep-ms <n>`: 各ターゲット間で `n` ミリ秒待機（デフォルト: 200）
-- `--strict`: High finding があると `exit 1`
-- `--report-json <file>`: レポートを JSON で保存
+- `--tables <file>`: table names (one per line)
+- `--auto-tables`: discover table/view names from `/rest/v1/` OpenAPI
+- `--noauth-probe`: test read access without auth headers
+- `--auth-matrix`: compare `noauth / anon / user`
+- `--user-jwt <jwt>`: user JWT used by `--auth-matrix`
+- `--storage-probe`: test Storage object list access per bucket
+- `--sample-read`: fetch one sample row to inspect keys (not recommended for production data)
+- `--sleep-ms <n>`: sleep `n` milliseconds between target probes (default: `200`)
+- `--strict`: exit with status `1` when high-severity findings exist
+- `--report-json <file>`: write summary/findings as JSON
+- `--sensitive <regex>`: regex for sensitive-looking field names
 
-## findings の扱い
+## Finding levels
 
-- `high`: 例) `noauth` で table read/list が成功
-- `medium`: 例) `anon` で read/list が成功、公開 bucket、敏感そうな名前
-- `low`: 現在は未使用（将来拡張用）
+- `high`: examples include successful `noauth` table read/list access
+- `medium`: examples include successful `anon` read/list access, public buckets, or sensitive-looking field names
+- `low`: reserved for future use
 
-`--strict` は `high > 0` のときに失敗終了します。
+`--strict` currently fails only when `high > 0`.
 
-## 注意点
+## Safety and scope
 
-- これは **外部公開面の挙動診断** です。完全な脆弱性診断ではありません。
-- RLS policy の中身精査、DB ロール権限監査、関数実装監査は別途必要です。
-- `--auto-tables` は OpenAPI 可視範囲に依存します。
-- RPC は副作用のある関数実行リスクを避けるため、このスクリプトでは未チェックです。
-- 既定ではテーブル本文を取得しません。`--sample-read` は検証環境でのみ推奨です。
+- This is an external exposure behavior check, not a full vulnerability assessment.
+- Full security review still requires RLS policy review, DB role/grant review, and function/code review.
+- `--auto-tables` depends on OpenAPI visibility and project configuration.
+- RPC checks are intentionally not included to avoid accidental execution of side-effect functions.
+- By default, table row bodies are not fetched. Use `--sample-read` only in safe environments.
 
-## 補足
+## Notes
 
-- 実行例は [`run.sh`](./run.sh) にも記載しています。
-- 詳細オプションは `./sb-audit.sh --help` を参照してください。
+- See [`run.sh`](./run.sh) for ready-to-run examples.
+- For full option details, run `./sb-audit.sh --help`.
