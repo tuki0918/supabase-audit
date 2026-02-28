@@ -6,7 +6,7 @@ set -euo pipefail
 #   ./sb-audit.sh --url "https://xxxx.supabase.co" --anon "eyJ..." --tables tables.txt \
 #       --sensitive "(mail|email|password|phone|token|secret)"
 #   ./sb-audit.sh --url "https://xxxx.supabase.co" --anon "eyJ..." --auto-tables \
-#       --auth-matrix --rpc-probe --storage-probe \
+#       --auth-matrix --storage-probe \
 #       --strict --report-json report.json
 #
 # Env vars also supported (args override env):
@@ -27,8 +27,9 @@ Optional:
   --noauth-probe         Probe read endpoints without apikey/auth headers
   --auth-matrix          Compare access with noauth / anon / user JWT
   --user-jwt <jwt>       User JWT for --auth-matrix (or env SUPABASE_USER_JWT)
-  --rpc-probe            Probe discovered RPC endpoints with POST {}
   --storage-probe        Probe storage object/list access per bucket
+  --sample-read          Fetch 1 row sample for key inspection (risk: reads data)
+  --sleep-ms <n>         Sleep n milliseconds between each target probe (default: 200)
   --strict               Exit 1 when high-severity findings are detected
   --report-json <file>   Write summary + findings JSON report
   --sensitive <regex>    Regex for sensitive keys (default: (email|password|phone|token|secret|address|birth|salary|ip))
@@ -36,6 +37,7 @@ Optional:
 
 Notes:
 - If --auto-tables is enabled, detected names are merged with --tables when both are provided.
+- Default mode does NOT fetch row body from tables. Use --sample-read only in safe environments.
 EOF
 }
 
@@ -47,8 +49,9 @@ ARG_SENSITIVE=""
 AUTO_TABLES=false
 NOAUTH_PROBE=false
 AUTH_MATRIX=false
-RPC_PROBE=false
 STORAGE_PROBE=false
+SAMPLE_READ=false
+SLEEP_MS=200
 STRICT_MODE=false
 REPORT_JSON_FILE=""
 REPORT_JSON_ENABLED=false
@@ -72,8 +75,9 @@ while [[ $# -gt 0 ]]; do
     --auto-tables) AUTO_TABLES=true; shift ;;
     --noauth-probe) NOAUTH_PROBE=true; shift ;;
     --auth-matrix) AUTH_MATRIX=true; shift ;;
-    --rpc-probe) RPC_PROBE=true; shift ;;
     --storage-probe) STORAGE_PROBE=true; shift ;;
+    --sample-read) SAMPLE_READ=true; shift ;;
+    --sleep-ms) require_option_value "$1" "${2:-}"; SLEEP_MS="${2}"; shift 2 ;;
     --strict) STRICT_MODE=true; shift ;;
     --report-json) require_option_value "$1" "${2:-}"; REPORT_JSON_ENABLED=true; REPORT_JSON_FILE="${2}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -110,6 +114,10 @@ if [[ "${REPORT_JSON_ENABLED}" == "true" && -z "${REPORT_JSON_FILE}" ]]; then
 fi
 if [[ -n "${REPORT_JSON_FILE}" && "${REPORT_JSON_FILE}" == "--"* ]]; then
   echo "--report-json requires a file path argument" >&2
+  exit 1
+fi
+if ! [[ "${SLEEP_MS}" =~ ^[0-9]+$ ]]; then
+  echo "--sleep-ms requires a non-negative integer" >&2
   exit 1
 fi
 RUN_AT_UTC="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
@@ -172,22 +180,11 @@ mode_read_status() {
   request_status_with_mode \
     "${mode}" \
     "GET" \
-    "${SUPABASE_URL}/rest/v1/${table}?select=*&limit=1" \
+    "${SUPABASE_URL}/rest/v1/${table}?select=*&limit=0" \
     "" \
     "" \
     "Range: 0-0" \
     "Prefer: count=exact"
-}
-
-mode_rpc_status() {
-  local mode="$1"
-  local rpc="$2"
-  request_status_with_mode \
-    "${mode}" \
-    "POST" \
-    "${SUPABASE_URL}/rest/v1/rpc/${rpc}" \
-    "{}" \
-    "application/json"
 }
 
 mode_storage_list_status() {
@@ -202,7 +199,6 @@ mode_storage_list_status() {
 }
 
 DISCOVERED_TABLES_FILE="$(mktemp)"
-DISCOVERED_RPC_FILE="$(mktemp)"
 DISCOVERED_BUCKETS_FILE="$(mktemp)"
 FINDINGS_FILE="$(mktemp)"
 COMBINED_TABLES_FILE=""
@@ -276,8 +272,14 @@ probe_access() {
   fi
 }
 
+sleep_if_needed() {
+  if [[ "${SLEEP_MS}" -gt 0 ]]; then
+    sleep "$(awk "BEGIN { printf \"%.3f\", ${SLEEP_MS} / 1000 }")"
+  fi
+}
+
 cleanup() {
-  rm -f "${DISCOVERED_TABLES_FILE}" "${DISCOVERED_RPC_FILE}" "${DISCOVERED_BUCKETS_FILE}" "${FINDINGS_FILE}"
+  rm -f "${DISCOVERED_TABLES_FILE}" "${DISCOVERED_BUCKETS_FILE}" "${FINDINGS_FILE}"
   if [[ -n "${COMBINED_TABLES_FILE}" ]]; then
     rm -f "${COMBINED_TABLES_FILE}"
   fi
@@ -306,22 +308,15 @@ discover_from_openapi() {
     | awk -F'/' 'NF==1 && $1 != "rpc" && $1 != "" { print $1 }' \
     | sort -u > "${DISCOVERED_TABLES_FILE}"
 
-  jq -r '.paths | keys[]' "${openapi_body}" \
-    | sed -n 's#^/rpc/##p' \
-    | awk -F'/' 'NF==1 && $1 != "" { print $1 }' \
-    | sort -u > "${DISCOVERED_RPC_FILE}"
-
   rm -f "${openapi_headers}" "${openapi_body}"
   return 0
 }
 
-if [[ "${AUTO_TABLES}" == "true" || "${RPC_PROBE}" == "true" ]]; then
+if [[ "${AUTO_TABLES}" == "true" ]]; then
   echo "## OpenAPI discovery"
   if discover_from_openapi; then
     discovered_tables_count="$(wc -l < "${DISCOVERED_TABLES_FILE}" | xargs)"
-    discovered_rpc_count="$(wc -l < "${DISCOVERED_RPC_FILE}" | xargs)"
     echo "Discovered tables/views: ${discovered_tables_count}"
-    echo "Discovered rpc endpoints: ${discovered_rpc_count}"
 
     if [[ "${AUTO_TABLES}" == "true" && -n "${TABLES_FILE}" ]]; then
       COMBINED_TABLES_FILE="$(mktemp)"
@@ -335,25 +330,8 @@ if [[ "${AUTO_TABLES}" == "true" || "${RPC_PROBE}" == "true" ]]; then
       ACTIVE_TABLES_FILE="${DISCOVERED_TABLES_FILE}"
       echo "Using OpenAPI-discovered table targets"
     fi
-
-    if [[ -s "${DISCOVERED_RPC_FILE}" ]]; then
-      echo "RPC list:"
-      sed 's/^/  - /' "${DISCOVERED_RPC_FILE}"
-      sensitive_rpc="$(grep -Ei "${SENSITIVE_REGEX}" "${DISCOVERED_RPC_FILE}" || true)"
-      if [[ -n "${sensitive_rpc}" ]]; then
-        echo "  ⚠ Sensitive-like rpc names found:"
-        echo "${sensitive_rpc}" | sed 's/^/    - /'
-        while IFS= read -r rpc_name; do
-          [[ -z "${rpc_name}" ]] && continue
-          add_finding "medium" "rpc_name" "${rpc_name}" "RPC name matches sensitive pattern"
-        done <<< "${sensitive_rpc}"
-      fi
-    fi
   else
     echo "Could not read OpenAPI from /rest/v1/ (auth blocked or not exposed)."
-    if [[ "${RPC_PROBE}" == "true" ]]; then
-      add_finding "medium" "openapi" "/rest/v1/" "OpenAPI discovery failed; RPC probe coverage is incomplete"
-    fi
     if [[ "${AUTO_TABLES}" == "true" && -z "${TABLES_FILE}" ]]; then
       echo "Auto discovery failed and no --tables file was provided." >&2
       exit 1
@@ -373,8 +351,9 @@ echo "Auto tables: ${AUTO_TABLES}"
 echo "No-auth probe: ${NOAUTH_PROBE}"
 echo "Auth matrix: ${AUTH_MATRIX}"
 echo "User JWT provided: $( [[ "${USER_JWT_PROVIDED}" == "true" ]] && echo yes || echo no )"
-echo "RPC probe: ${RPC_PROBE}"
 echo "Storage probe: ${STORAGE_PROBE}"
+echo "Sample read: ${SAMPLE_READ}"
+echo "Sleep(ms): ${SLEEP_MS}"
 echo "Strict mode: ${STRICT_MODE}"
 echo "Report JSON: ${REPORT_JSON_FILE:-<none>}"
 echo "Sensitive regex: ${SENSITIVE_REGEX}"
@@ -435,6 +414,7 @@ if [[ "${STORAGE_PROBE}" == "true" ]]; then
         "Storage list endpoint is accessible without auth" \
         "Storage list endpoint is accessible with anon key" \
         "true"
+      sleep_if_needed
     done < "${DISCOVERED_BUCKETS_FILE}"
   else
     echo "No buckets discovered; skip storage probe."
@@ -482,13 +462,17 @@ while IFS= read -r table; do
 
   resp_headers="$(mktemp)"
   resp_body="$(mktemp)"
+  read_query="?select=*&limit=0"
+  if [[ "${SAMPLE_READ}" == "true" ]]; then
+    read_query="?select=*&limit=1"
+  fi
 
   http_code="$(
     curl -sS -D "${resp_headers}" -o "${resp_body}" -w "%{http_code}" \
       "${auth_headers[@]}" \
       -H "Range: 0-0" \
       -H "Prefer: count=exact" \
-      "${SUPABASE_URL}/rest/v1/${table}?select=*&limit=1" || true
+      "${SUPABASE_URL}/rest/v1/${table}${read_query}" || true
   )"
 
   echo "  READ status: ${http_code}"
@@ -496,7 +480,7 @@ while IFS= read -r table; do
   cr="$(grep -i '^content-range:' "${resp_headers}" | tail -n 1 | sed 's/\r$//' || true)"
   [[ -n "$cr" ]] && echo "  ${cr}"
 
-  if [[ "${http_code}" == "200" ]]; then
+  if [[ "${http_code}" == "200" && "${SAMPLE_READ}" == "true" ]]; then
     if jq -e . "${resp_body}" >/dev/null 2>&1; then
       keys="$(extract_keys < "${resp_body}" | tr '\n' ' ' || true)"
       [[ -n "$keys" ]] && echo "  Keys(sample): ${keys}"
@@ -521,6 +505,8 @@ while IFS= read -r table; do
     else
       echo "  Body is not JSON."
     fi
+  elif [[ "${http_code}" == "200" ]]; then
+    echo "  Sample read skipped (enable with --sample-read in safe environments)"
   elif [[ "${http_code}" == "401" || "${http_code}" == "403" ]]; then
     echo "  READ blocked (good if intended)"
   else
@@ -530,29 +516,9 @@ while IFS= read -r table; do
 
   rm -f "${resp_headers}" "${resp_body}"
 
+  sleep_if_needed
   echo
 done < "${ACTIVE_TABLES_FILE}"
-
-if [[ "${RPC_PROBE}" == "true" ]]; then
-  echo "## RPC probes"
-  if [[ -s "${DISCOVERED_RPC_FILE}" ]]; then
-    while IFS= read -r rpc; do
-      [[ -z "${rpc}" ]] && continue
-      echo "-- ${rpc}"
-      probe_access \
-        "mode_rpc_status" \
-        "${rpc}" \
-        "RPC" \
-        "rpc_exec" \
-        "RPC appears callable without auth" \
-        "RPC appears callable with anon key" \
-        "true"
-    done < "${DISCOVERED_RPC_FILE}"
-  else
-    echo "No RPC discovered; skip RPC probe."
-  fi
-  echo
-fi
 
 total_findings="$(wc -l < "${FINDINGS_FILE}" | xargs)"
 high_findings="$(jq -s '[.[] | select(.severity=="high")] | length' "${FINDINGS_FILE}")"
@@ -575,8 +541,9 @@ if [[ "${REPORT_JSON_ENABLED}" == "true" ]]; then
     --argjson auto_tables "${AUTO_TABLES}" \
     --argjson noauth_probe "${NOAUTH_PROBE}" \
     --argjson auth_matrix "${AUTH_MATRIX}" \
-    --argjson rpc_probe "${RPC_PROBE}" \
     --argjson storage_probe "${STORAGE_PROBE}" \
+    --argjson sample_read "${SAMPLE_READ}" \
+    --argjson sleep_ms "${SLEEP_MS}" \
     --argjson strict_mode "${STRICT_MODE}" \
     --argjson user_jwt_provided "${USER_JWT_PROVIDED}" \
     --argjson total "${total_findings}" \
@@ -593,8 +560,9 @@ if [[ "${REPORT_JSON_ENABLED}" == "true" ]]; then
         auto_tables: $auto_tables,
         noauth_probe: $noauth_probe,
         auth_matrix: $auth_matrix,
-        rpc_probe: $rpc_probe,
         storage_probe: $storage_probe,
+        sample_read: $sample_read,
+        sleep_ms: $sleep_ms,
         strict_mode: $strict_mode,
         user_jwt_provided: $user_jwt_provided
       },
