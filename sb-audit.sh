@@ -11,20 +11,23 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-sb-audit.sh - Supabase external-view audit (ALLOWLIST tables)
+sb-audit.sh - Supabase external-view audit
 
 Required:
   --tables <file>        File containing table names (one per line)
+                         (or use --auto-tables)
   --url <supabase_url>   e.g. https://xxxx.supabase.co   (or env SUPABASE_URL)
   --anon <anon_key>      anon key JWT                    (or env SUPABASE_ANON_KEY)
 
 Optional:
+  --auto-tables          Discover table/view names from /rest/v1/ OpenAPI
+  --noauth-probe         Probe read endpoints without apikey/auth headers
   --sensitive <regex>    Regex for sensitive keys (default: (email|password|phone|token|secret|address|birth|salary|ip))
   --write-probe          Try safe-ish write probe (OFF by default; see notes)
   -h, --help             Show this help
 
 Notes:
-- This script does NOT auto-discover tables. Provide an allowlist tables file.
+- If --auto-tables is enabled, detected names are merged with --tables when both are provided.
 - Write probe is dangerous; keep it off unless you know your schema/policies.
 EOF
 }
@@ -33,6 +36,8 @@ TABLES_FILE=""
 ARG_URL=""
 ARG_ANON=""
 ARG_SENSITIVE=""
+AUTO_TABLES=false
+NOAUTH_PROBE=false
 WRITE_PROBE=false
 
 while [[ $# -gt 0 ]]; do
@@ -41,6 +46,8 @@ while [[ $# -gt 0 ]]; do
     --url) ARG_URL="${2:-}"; shift 2 ;;
     --anon) ARG_ANON="${2:-}"; shift 2 ;;
     --sensitive) ARG_SENSITIVE="${2:-}"; shift 2 ;;
+    --auto-tables) AUTO_TABLES=true; shift ;;
+    --noauth-probe) NOAUTH_PROBE=true; shift ;;
     --write-probe) WRITE_PROBE=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
@@ -51,8 +58,12 @@ SUPABASE_URL="${ARG_URL:-${SUPABASE_URL:-}}"
 SUPABASE_ANON_KEY="${ARG_ANON:-${SUPABASE_ANON_KEY:-}}"
 SENSITIVE_REGEX="${ARG_SENSITIVE:-${SENSITIVE_REGEX:-"(email|password|pass|phone|tel|ssn|credit|card|token|secret|address|birth|birthday|salary|ip)"}}"
 
-if [[ -z "${TABLES_FILE}" || ! -f "${TABLES_FILE}" ]]; then
-  echo "tables file is required and must exist: --tables <file>" >&2
+if [[ -n "${TABLES_FILE}" && ! -f "${TABLES_FILE}" ]]; then
+  echo "tables file must exist: --tables <file>" >&2
+  exit 1
+fi
+if [[ -z "${TABLES_FILE}" && "${AUTO_TABLES}" != "true" ]]; then
+  echo "Either --tables <file> or --auto-tables is required." >&2
   exit 1
 fi
 if [[ -z "${SUPABASE_URL}" ]]; then
@@ -72,9 +83,97 @@ auth_headers=(
   -H "Authorization: Bearer ${SUPABASE_ANON_KEY}"
 )
 
-echo "== Supabase external audit (allowlist) =="
+DISCOVERED_TABLES_FILE="$(mktemp)"
+DISCOVERED_RPC_FILE="$(mktemp)"
+COMBINED_TABLES_FILE=""
+ACTIVE_TABLES_FILE="${TABLES_FILE}"
+
+cleanup() {
+  rm -f "${DISCOVERED_TABLES_FILE}" "${DISCOVERED_RPC_FILE}"
+  if [[ -n "${COMBINED_TABLES_FILE}" ]]; then
+    rm -f "${COMBINED_TABLES_FILE}"
+  fi
+}
+trap cleanup EXIT
+
+discover_from_openapi() {
+  local openapi_headers openapi_body openapi_code
+  openapi_headers="$(mktemp)"
+  openapi_body="$(mktemp)"
+
+  openapi_code="$(
+    curl -sS -D "${openapi_headers}" -o "${openapi_body}" -w "%{http_code}" \
+      "${auth_headers[@]}" \
+      -H "Accept: application/openapi+json" \
+      "${SUPABASE_URL}/rest/v1/" || true
+  )"
+
+  if [[ "${openapi_code}" != "200" ]] || ! jq -e '.paths' "${openapi_body}" >/dev/null 2>&1; then
+    rm -f "${openapi_headers}" "${openapi_body}"
+    return 1
+  fi
+
+  jq -r '.paths | keys[]' "${openapi_body}" \
+    | sed -n 's#^/##p' \
+    | awk -F'/' 'NF==1 && $1 != "rpc" && $1 != "" { print $1 }' \
+    | sort -u > "${DISCOVERED_TABLES_FILE}"
+
+  jq -r '.paths | keys[]' "${openapi_body}" \
+    | sed -n 's#^/rpc/##p' \
+    | awk -F'/' 'NF==1 && $1 != "" { print $1 }' \
+    | sort -u > "${DISCOVERED_RPC_FILE}"
+
+  rm -f "${openapi_headers}" "${openapi_body}"
+  return 0
+}
+
+if [[ "${AUTO_TABLES}" == "true" ]]; then
+  echo "## OpenAPI discovery"
+  if discover_from_openapi; then
+    discovered_tables_count="$(wc -l < "${DISCOVERED_TABLES_FILE}" | xargs)"
+    discovered_rpc_count="$(wc -l < "${DISCOVERED_RPC_FILE}" | xargs)"
+    echo "Discovered tables/views: ${discovered_tables_count}"
+    echo "Discovered rpc endpoints: ${discovered_rpc_count}"
+
+    if [[ -n "${TABLES_FILE}" ]]; then
+      COMBINED_TABLES_FILE="$(mktemp)"
+      awk '
+        { sub(/#.*/, "", $0); gsub(/^[ \t]+|[ \t]+$/, "", $0); if ($0 != "") print $0 }
+      ' "${TABLES_FILE}" "${DISCOVERED_TABLES_FILE}" \
+        | sort -u > "${COMBINED_TABLES_FILE}"
+      ACTIVE_TABLES_FILE="${COMBINED_TABLES_FILE}"
+      echo "Merged table targets: file + OpenAPI"
+    else
+      ACTIVE_TABLES_FILE="${DISCOVERED_TABLES_FILE}"
+      echo "Using OpenAPI-discovered table targets"
+    fi
+
+    if [[ -s "${DISCOVERED_RPC_FILE}" ]]; then
+      echo "RPC list:"
+      sed 's/^/  - /' "${DISCOVERED_RPC_FILE}"
+      sensitive_rpc="$(grep -Ei "${SENSITIVE_REGEX}" "${DISCOVERED_RPC_FILE}" || true)"
+      if [[ -n "${sensitive_rpc}" ]]; then
+        echo "  ⚠ Sensitive-like rpc names found:"
+        echo "${sensitive_rpc}" | sed 's/^/    - /'
+      fi
+    fi
+  else
+    echo "Could not read OpenAPI from /rest/v1/ (auth blocked or not exposed)."
+    if [[ -z "${TABLES_FILE}" ]]; then
+      echo "Auto discovery failed and no --tables file was provided." >&2
+      exit 1
+    fi
+    echo "Falling back to --tables only."
+  fi
+  echo
+fi
+
+echo "== Supabase external audit =="
 echo "URL: ${SUPABASE_URL}"
-echo "Tables: ${TABLES_FILE}"
+echo "Tables file input: ${TABLES_FILE:-<none>}"
+echo "Tables target source: ${ACTIVE_TABLES_FILE}"
+echo "Auto tables: ${AUTO_TABLES}"
+echo "No-auth probe: ${NOAUTH_PROBE}"
 echo "Sensitive regex: ${SENSITIVE_REGEX}"
 echo "Write probe: ${WRITE_PROBE}"
 echo
@@ -125,6 +224,19 @@ while IFS= read -r table; do
   [[ -z "$table" ]] && continue
 
   echo "-- ${table}"
+
+  if [[ "${NOAUTH_PROBE}" == "true" ]]; then
+    noauth_code="$(
+      curl -sS -o /dev/null -w "%{http_code}" \
+        -H "Range: 0-0" \
+        -H "Prefer: count=exact" \
+        "${SUPABASE_URL}/rest/v1/${table}?select=*&limit=1" || true
+    )"
+    echo "  NOAUTH READ status: ${noauth_code}"
+    if [[ "${noauth_code}" == "200" ]]; then
+      echo "  ⚠ NOAUTHで読み取り可能です (apikey/Authorization なし)"
+    fi
+  fi
 
   resp_headers="$(mktemp)"
   resp_body="$(mktemp)"
@@ -193,6 +305,6 @@ while IFS= read -r table; do
   fi
 
   echo
-done < "${TABLES_FILE}"
+done < "${ACTIVE_TABLES_FILE}"
 
 echo "Done."
