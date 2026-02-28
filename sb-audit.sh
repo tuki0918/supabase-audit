@@ -6,7 +6,7 @@ set -euo pipefail
 #   ./sb-audit.sh --url "https://xxxx.supabase.co" --anon "eyJ..." --tables tables.txt \
 #       --sensitive "(mail|email|password|phone|token|secret)"
 #   ./sb-audit.sh --url "https://xxxx.supabase.co" --anon "eyJ..." --auto-tables \
-#       --auth-matrix --rpc-probe --patch-delete-probe --storage-probe \
+#       --auth-matrix --rpc-probe --storage-probe \
 #       --strict --report-json report.json
 #
 # Env vars also supported (args override env):
@@ -28,19 +28,14 @@ Optional:
   --auth-matrix          Compare access with noauth / anon / user JWT
   --user-jwt <jwt>       User JWT for --auth-matrix (or env SUPABASE_USER_JWT)
   --rpc-probe            Probe discovered RPC endpoints with POST {}
-  --patch-delete-probe   Probe PATCH/DELETE with a 0-row filter (safe-ish)
-  --mutation-filter <q>  Query filter for mutation probe
-                         (default: id=eq.__sb_audit_no_row__)
   --storage-probe        Probe storage object/list access per bucket
   --strict               Exit 1 when high-severity findings are detected
   --report-json <file>   Write summary + findings JSON report
   --sensitive <regex>    Regex for sensitive keys (default: (email|password|phone|token|secret|address|birth|salary|ip))
-  --write-probe          Try safe-ish write probe (OFF by default; see notes)
   -h, --help             Show this help
 
 Notes:
 - If --auto-tables is enabled, detected names are merged with --tables when both are provided.
-- --patch-delete-probe and --write-probe can be risky; use only in controlled env.
 EOF
 }
 
@@ -53,13 +48,10 @@ AUTO_TABLES=false
 NOAUTH_PROBE=false
 AUTH_MATRIX=false
 RPC_PROBE=false
-PATCH_DELETE_PROBE=false
-MUTATION_FILTER="id=eq.__sb_audit_no_row__"
 STORAGE_PROBE=false
 STRICT_MODE=false
 REPORT_JSON_FILE=""
 REPORT_JSON_ENABLED=false
-WRITE_PROBE=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -72,12 +64,9 @@ while [[ $# -gt 0 ]]; do
     --noauth-probe) NOAUTH_PROBE=true; shift ;;
     --auth-matrix) AUTH_MATRIX=true; shift ;;
     --rpc-probe) RPC_PROBE=true; shift ;;
-    --patch-delete-probe) PATCH_DELETE_PROBE=true; shift ;;
-    --mutation-filter) MUTATION_FILTER="${2:-}"; shift 2 ;;
     --storage-probe) STORAGE_PROBE=true; shift ;;
     --strict) STRICT_MODE=true; shift ;;
     --report-json) REPORT_JSON_ENABLED=true; REPORT_JSON_FILE="${2:-}"; shift 2 ;;
-    --write-probe) WRITE_PROBE=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -177,42 +166,6 @@ mode_rpc_status() {
     -X POST \
     --data '{}' \
     "${SUPABASE_URL}/rest/v1/rpc/${rpc}" || true
-}
-
-mode_mutation_status() {
-  local mode="$1"
-  local method="$2"
-  local table="$3"
-  local filter_q="$4"
-  local -a headers=()
-  case "${mode}" in
-    noauth) ;;
-    anon) headers=("${auth_headers[@]}") ;;
-    user)
-      if [[ -z "${SUPABASE_USER_JWT}" ]]; then
-        echo "N/A"
-        return 0
-      fi
-      headers=("${user_headers[@]}")
-      ;;
-    *) echo "N/A"; return 0 ;;
-  esac
-
-  if [[ "${method}" == "PATCH" ]]; then
-    curl -sS -o /dev/null -w "%{http_code}" \
-      "${headers[@]}" \
-      -H "Content-Type: application/json" \
-      -H "Prefer: return=minimal" \
-      -X PATCH \
-      --data '{}' \
-      "${SUPABASE_URL}/rest/v1/${table}?${filter_q}&limit=1" || true
-  else
-    curl -sS -o /dev/null -w "%{http_code}" \
-      "${headers[@]}" \
-      -H "Prefer: return=minimal" \
-      -X DELETE \
-      "${SUPABASE_URL}/rest/v1/${table}?${filter_q}&limit=1" || true
-  fi
 }
 
 mode_storage_list_status() {
@@ -363,13 +316,10 @@ echo "No-auth probe: ${NOAUTH_PROBE}"
 echo "Auth matrix: ${AUTH_MATRIX}"
 echo "User JWT provided: $( [[ -n "${SUPABASE_USER_JWT}" ]] && echo yes || echo no )"
 echo "RPC probe: ${RPC_PROBE}"
-echo "PATCH/DELETE probe: ${PATCH_DELETE_PROBE}"
-echo "Mutation filter: ${MUTATION_FILTER}"
 echo "Storage probe: ${STORAGE_PROBE}"
 echo "Strict mode: ${STRICT_MODE}"
 echo "Report JSON: ${REPORT_JSON_FILE:-<none>}"
 echo "Sensitive regex: ${SENSITIVE_REGEX}"
-echo "Write probe: ${WRITE_PROBE}"
 if [[ "${AUTH_MATRIX}" == "true" && -z "${SUPABASE_USER_JWT}" ]]; then
   echo "Note: --auth-matrix enabled without --user-jwt (user= N/A)."
 fi
@@ -549,78 +499,6 @@ while IFS= read -r table; do
 
   rm -f "${resp_headers}" "${resp_body}"
 
-  if [[ "${PATCH_DELETE_PROBE}" == "true" ]]; then
-    echo "  PATCH/DELETE probe (safe-ish): filter=${MUTATION_FILTER}"
-    if [[ "${AUTH_MATRIX}" == "true" ]]; then
-      p_noauth="$(mode_mutation_status "noauth" "PATCH" "${table}" "${MUTATION_FILTER}")"
-      p_anon="$(mode_mutation_status "anon" "PATCH" "${table}" "${MUTATION_FILTER}")"
-      p_user="$(mode_mutation_status "user" "PATCH" "${table}" "${MUTATION_FILTER}")"
-      d_noauth="$(mode_mutation_status "noauth" "DELETE" "${table}" "${MUTATION_FILTER}")"
-      d_anon="$(mode_mutation_status "anon" "DELETE" "${table}" "${MUTATION_FILTER}")"
-      d_user="$(mode_mutation_status "user" "DELETE" "${table}" "${MUTATION_FILTER}")"
-      echo "    PATCH status matrix: noauth=${p_noauth} anon=${p_anon} user=${p_user}"
-      echo "    DELETE status matrix: noauth=${d_noauth} anon=${d_anon} user=${d_user}"
-      if is_success_code "${p_noauth}"; then
-        add_finding "high" "table_patch" "${table}" "PATCH appears allowed without auth"
-      fi
-      if is_success_code "${d_noauth}"; then
-        add_finding "high" "table_delete" "${table}" "DELETE appears allowed without auth"
-      fi
-      if is_success_code "${p_anon}"; then
-        add_finding "medium" "table_patch" "${table}" "PATCH appears allowed with anon key"
-      fi
-      if is_success_code "${d_anon}"; then
-        add_finding "medium" "table_delete" "${table}" "DELETE appears allowed with anon key"
-      fi
-    else
-      p_anon="$(mode_mutation_status "anon" "PATCH" "${table}" "${MUTATION_FILTER}")"
-      d_anon="$(mode_mutation_status "anon" "DELETE" "${table}" "${MUTATION_FILTER}")"
-      echo "    PATCH status (anon): ${p_anon}"
-      echo "    DELETE status (anon): ${d_anon}"
-      if is_success_code "${p_anon}"; then
-        add_finding "medium" "table_patch" "${table}" "PATCH appears allowed with anon key"
-      fi
-      if is_success_code "${d_anon}"; then
-        add_finding "medium" "table_delete" "${table}" "DELETE appears allowed with anon key"
-      fi
-      if [[ "${NOAUTH_PROBE}" == "true" ]]; then
-        p_noauth="$(mode_mutation_status "noauth" "PATCH" "${table}" "${MUTATION_FILTER}")"
-        d_noauth="$(mode_mutation_status "noauth" "DELETE" "${table}" "${MUTATION_FILTER}")"
-        echo "    PATCH status (noauth): ${p_noauth}"
-        echo "    DELETE status (noauth): ${d_noauth}"
-        if is_success_code "${p_noauth}"; then
-          add_finding "high" "table_patch" "${table}" "PATCH appears allowed without auth"
-        fi
-        if is_success_code "${d_noauth}"; then
-          add_finding "high" "table_delete" "${table}" "DELETE appears allowed without auth"
-        fi
-      fi
-    fi
-  fi
-
-  # Optional write probe: SAFE-ish mode only (Prefer: return=minimal + {}), still risky.
-  if [[ "${WRITE_PROBE}" == "true" ]]; then
-    echo "  WRITE probe (dangerous): attempting POST {} with return=minimal"
-    resp_headers2="$(mktemp)"
-    resp_body2="$(mktemp)"
-    wcode="$(
-      curl -sS -D "${resp_headers2}" -o "${resp_body2}" -w "%{http_code}" \
-        "${auth_headers[@]}" \
-        -H "Content-Type: application/json" \
-        -H "Prefer: return=minimal" \
-        -X POST \
-        --data '{}' \
-        "${SUPABASE_URL}/rest/v1/${table}" || true
-    )"
-    echo "    WRITE status: ${wcode}"
-    if is_success_code "${wcode}"; then
-      add_finding "medium" "table_insert" "${table}" "INSERT appears allowed with anon key"
-    fi
-    werr="$(cat "${resp_body2}" | head -c 400 | tr '\n' ' ' || true)"
-    [[ -n "$werr" ]] && echo "    RESP: ${werr}"
-    rm -f "${resp_headers2}" "${resp_body2}"
-  fi
-
   echo
 done < "${ACTIVE_TABLES_FILE}"
 
@@ -684,11 +562,8 @@ if [[ "${REPORT_JSON_ENABLED}" == "true" ]]; then
     --arg noauth_probe "${NOAUTH_PROBE}" \
     --arg auth_matrix "${AUTH_MATRIX}" \
     --arg rpc_probe "${RPC_PROBE}" \
-    --arg patch_delete_probe "${PATCH_DELETE_PROBE}" \
     --arg storage_probe "${STORAGE_PROBE}" \
-    --arg write_probe "${WRITE_PROBE}" \
     --arg strict_mode "${STRICT_MODE}" \
-    --arg mutation_filter "${MUTATION_FILTER}" \
     --arg user_jwt_provided "$( [[ -n "${SUPABASE_USER_JWT}" ]] && echo yes || echo no )" \
     --argjson total "${total_findings}" \
     --argjson high "${high_findings}" \
@@ -705,11 +580,8 @@ if [[ "${REPORT_JSON_ENABLED}" == "true" ]]; then
         noauth_probe: $noauth_probe,
         auth_matrix: $auth_matrix,
         rpc_probe: $rpc_probe,
-        patch_delete_probe: $patch_delete_probe,
         storage_probe: $storage_probe,
-        write_probe: $write_probe,
         strict_mode: $strict_mode,
-        mutation_filter: $mutation_filter,
         user_jwt_provided: $user_jwt_provided
       },
       summary: {

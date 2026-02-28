@@ -6,11 +6,11 @@ SUPABASE_URL=https://XXX.supabase.co SUPABASE_ANON_KEY=XXX ./sb-audit.sh --table
 # OpenAPI auto-discovery + no-auth probe
 # SUPABASE_URL=https://XXX.supabase.co SUPABASE_ANON_KEY=XXX ./sb-audit.sh --auto-tables --noauth-probe
 
-# Extended audit (auth matrix + rpc + mutation + storage)
+# Extended audit (auth matrix + rpc + storage)
 # SUPABASE_URL=https://XXX.supabase.co SUPABASE_ANON_KEY=XXX SUPABASE_USER_JWT=XXX \
-#   ./sb-audit.sh --auto-tables --auth-matrix --rpc-probe --patch-delete-probe --storage-probe
+#   ./sb-audit.sh --auto-tables --auth-matrix --rpc-probe --storage-probe
 
 # CI-friendly (fail on high findings + JSON output)
 # SUPABASE_URL=https://XXX.supabase.co SUPABASE_ANON_KEY=XXX SUPABASE_USER_JWT=XXX \
-#   ./sb-audit.sh --auto-tables --auth-matrix --rpc-probe --patch-delete-probe --storage-probe \
+#   ./sb-audit.sh --auto-tables --auth-matrix --rpc-probe --storage-probe \
 #   --strict --report-json report.json

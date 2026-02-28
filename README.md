@@ -9,7 +9,6 @@ Supabase の外部公開 API 面（主に PostgREST / Storage / RPC）を簡易�
 - OpenAPI からのテーブル/RPC 自動検出（`--auto-tables`）
 - `noauth / anon / user` のアクセス比較（`--auth-matrix`）
 - RPC 実行可否チェック（`--rpc-probe`）
-- PATCH/DELETE の安全寄りプローブ（`--patch-delete-probe`）
 - Storage バケット列挙と list 可否チェック（`--storage-probe`）
 - 検知結果の JSON 出力（`--report-json`）
 - High finding 検知時に CI を fail（`--strict`）
@@ -45,7 +44,7 @@ SUPABASE_URL=https://xxx.supabase.co \
 SUPABASE_ANON_KEY=xxx \
 SUPABASE_USER_JWT=xxx \
 ./sb-audit.sh \
-  --auto-tables --auth-matrix --rpc-probe --patch-delete-probe --storage-probe \
+  --auto-tables --auth-matrix --rpc-probe --storage-probe \
   --strict --report-json report.json
 ```
 
@@ -57,10 +56,7 @@ SUPABASE_USER_JWT=xxx \
 - `--auth-matrix`: `noauth / anon / user` を比較表示
 - `--user-jwt <jwt>`: `--auth-matrix` の user 用 JWT
 - `--rpc-probe`: 抽出した RPC へ `POST {}` を試行
-- `--patch-delete-probe`: 0件想定フィルタで PATCH/DELETE を試行
-- `--mutation-filter <q>`: mutation 用クエリ（既定: `id=eq.__sb_audit_no_row__`）
 - `--storage-probe`: 各バケットへの object list 試行
-- `--write-probe`: `POST {}` の write 試行（リスクあり）
 - `--strict`: High finding があると `exit 1`
 - `--report-json <file>`: レポートを JSON で保存
 
@@ -76,7 +72,6 @@ SUPABASE_USER_JWT=xxx \
 
 - これは **外部公開面の挙動診断** です。完全な脆弱性診断ではありません。
 - RLS policy の中身精査、DB ロール権限監査、関数実装監査は別途必要です。
-- `--patch-delete-probe` / `--write-probe` は検証環境でのみ推奨です。
 - `--auto-tables` / `--rpc-probe` は OpenAPI 可視範囲に依存します。
 
 ## 補足
