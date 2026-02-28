@@ -22,22 +22,35 @@ Required:
 Optional:
   --auto-tables          Discover table/view names from /rest/v1/ OpenAPI
   --noauth-probe         Probe read endpoints without apikey/auth headers
+  --auth-matrix          Compare access with noauth / anon / user JWT
+  --user-jwt <jwt>       User JWT for --auth-matrix (or env SUPABASE_USER_JWT)
+  --rpc-probe            Probe discovered RPC endpoints with POST {}
+  --patch-delete-probe   Probe PATCH/DELETE with a 0-row filter (safe-ish)
+  --mutation-filter <q>  Query filter for mutation probe
+                         (default: id=eq.__sb_audit_no_row__)
+  --storage-probe        Probe storage object/list access per bucket
   --sensitive <regex>    Regex for sensitive keys (default: (email|password|phone|token|secret|address|birth|salary|ip))
   --write-probe          Try safe-ish write probe (OFF by default; see notes)
   -h, --help             Show this help
 
 Notes:
 - If --auto-tables is enabled, detected names are merged with --tables when both are provided.
-- Write probe is dangerous; keep it off unless you know your schema/policies.
+- --patch-delete-probe and --write-probe can be risky; use only in controlled env.
 EOF
 }
 
 TABLES_FILE=""
 ARG_URL=""
 ARG_ANON=""
+ARG_USER_JWT=""
 ARG_SENSITIVE=""
 AUTO_TABLES=false
 NOAUTH_PROBE=false
+AUTH_MATRIX=false
+RPC_PROBE=false
+PATCH_DELETE_PROBE=false
+MUTATION_FILTER="id=eq.__sb_audit_no_row__"
+STORAGE_PROBE=false
 WRITE_PROBE=false
 
 while [[ $# -gt 0 ]]; do
@@ -45,9 +58,15 @@ while [[ $# -gt 0 ]]; do
     --tables) TABLES_FILE="${2:-}"; shift 2 ;;
     --url) ARG_URL="${2:-}"; shift 2 ;;
     --anon) ARG_ANON="${2:-}"; shift 2 ;;
+    --user-jwt) ARG_USER_JWT="${2:-}"; shift 2 ;;
     --sensitive) ARG_SENSITIVE="${2:-}"; shift 2 ;;
     --auto-tables) AUTO_TABLES=true; shift ;;
     --noauth-probe) NOAUTH_PROBE=true; shift ;;
+    --auth-matrix) AUTH_MATRIX=true; shift ;;
+    --rpc-probe) RPC_PROBE=true; shift ;;
+    --patch-delete-probe) PATCH_DELETE_PROBE=true; shift ;;
+    --mutation-filter) MUTATION_FILTER="${2:-}"; shift 2 ;;
+    --storage-probe) STORAGE_PROBE=true; shift ;;
     --write-probe) WRITE_PROBE=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
@@ -56,6 +75,7 @@ done
 
 SUPABASE_URL="${ARG_URL:-${SUPABASE_URL:-}}"
 SUPABASE_ANON_KEY="${ARG_ANON:-${SUPABASE_ANON_KEY:-}}"
+SUPABASE_USER_JWT="${ARG_USER_JWT:-${SUPABASE_USER_JWT:-}}"
 SENSITIVE_REGEX="${ARG_SENSITIVE:-${SENSITIVE_REGEX:-"(email|password|pass|phone|tel|ssn|credit|card|token|secret|address|birth|birthday|salary|ip)"}}"
 
 if [[ -n "${TABLES_FILE}" && ! -f "${TABLES_FILE}" ]]; then
@@ -83,13 +103,132 @@ auth_headers=(
   -H "Authorization: Bearer ${SUPABASE_ANON_KEY}"
 )
 
+user_headers=()
+if [[ -n "${SUPABASE_USER_JWT}" ]]; then
+  user_headers=(
+    -H "apikey: ${SUPABASE_ANON_KEY}"
+    -H "Authorization: Bearer ${SUPABASE_USER_JWT}"
+  )
+fi
+
+mode_read_status() {
+  local mode="$1"
+  local table="$2"
+  local -a headers=()
+  case "${mode}" in
+    noauth) ;;
+    anon) headers=("${auth_headers[@]}") ;;
+    user)
+      if [[ -z "${SUPABASE_USER_JWT}" ]]; then
+        echo "N/A"
+        return 0
+      fi
+      headers=("${user_headers[@]}")
+      ;;
+    *) echo "N/A"; return 0 ;;
+  esac
+
+  curl -sS -o /dev/null -w "%{http_code}" \
+    "${headers[@]}" \
+    -H "Range: 0-0" \
+    -H "Prefer: count=exact" \
+    "${SUPABASE_URL}/rest/v1/${table}?select=*&limit=1" || true
+}
+
+mode_rpc_status() {
+  local mode="$1"
+  local rpc="$2"
+  local -a headers=()
+  case "${mode}" in
+    noauth) ;;
+    anon) headers=("${auth_headers[@]}") ;;
+    user)
+      if [[ -z "${SUPABASE_USER_JWT}" ]]; then
+        echo "N/A"
+        return 0
+      fi
+      headers=("${user_headers[@]}")
+      ;;
+    *) echo "N/A"; return 0 ;;
+  esac
+
+  curl -sS -o /dev/null -w "%{http_code}" \
+    "${headers[@]}" \
+    -H "Content-Type: application/json" \
+    -X POST \
+    --data '{}' \
+    "${SUPABASE_URL}/rest/v1/rpc/${rpc}" || true
+}
+
+mode_mutation_status() {
+  local mode="$1"
+  local method="$2"
+  local table="$3"
+  local filter_q="$4"
+  local -a headers=()
+  case "${mode}" in
+    noauth) ;;
+    anon) headers=("${auth_headers[@]}") ;;
+    user)
+      if [[ -z "${SUPABASE_USER_JWT}" ]]; then
+        echo "N/A"
+        return 0
+      fi
+      headers=("${user_headers[@]}")
+      ;;
+    *) echo "N/A"; return 0 ;;
+  esac
+
+  if [[ "${method}" == "PATCH" ]]; then
+    curl -sS -o /dev/null -w "%{http_code}" \
+      "${headers[@]}" \
+      -H "Content-Type: application/json" \
+      -H "Prefer: return=minimal" \
+      -X PATCH \
+      --data '{}' \
+      "${SUPABASE_URL}/rest/v1/${table}?${filter_q}&limit=1" || true
+  else
+    curl -sS -o /dev/null -w "%{http_code}" \
+      "${headers[@]}" \
+      -H "Prefer: return=minimal" \
+      -X DELETE \
+      "${SUPABASE_URL}/rest/v1/${table}?${filter_q}&limit=1" || true
+  fi
+}
+
+mode_storage_list_status() {
+  local mode="$1"
+  local bucket="$2"
+  local -a headers=()
+  case "${mode}" in
+    noauth) ;;
+    anon) headers=("${auth_headers[@]}") ;;
+    user)
+      if [[ -z "${SUPABASE_USER_JWT}" ]]; then
+        echo "N/A"
+        return 0
+      fi
+      headers=("${user_headers[@]}")
+      ;;
+    *) echo "N/A"; return 0 ;;
+  esac
+
+  curl -sS -o /dev/null -w "%{http_code}" \
+    "${headers[@]}" \
+    -H "Content-Type: application/json" \
+    -X POST \
+    --data '{"limit":1,"offset":0}' \
+    "${SUPABASE_URL}/storage/v1/object/list/${bucket}" || true
+}
+
 DISCOVERED_TABLES_FILE="$(mktemp)"
 DISCOVERED_RPC_FILE="$(mktemp)"
+DISCOVERED_BUCKETS_FILE="$(mktemp)"
 COMBINED_TABLES_FILE=""
 ACTIVE_TABLES_FILE="${TABLES_FILE}"
 
 cleanup() {
-  rm -f "${DISCOVERED_TABLES_FILE}" "${DISCOVERED_RPC_FILE}"
+  rm -f "${DISCOVERED_TABLES_FILE}" "${DISCOVERED_RPC_FILE}" "${DISCOVERED_BUCKETS_FILE}"
   if [[ -n "${COMBINED_TABLES_FILE}" ]]; then
     rm -f "${COMBINED_TABLES_FILE}"
   fi
@@ -127,7 +266,7 @@ discover_from_openapi() {
   return 0
 }
 
-if [[ "${AUTO_TABLES}" == "true" ]]; then
+if [[ "${AUTO_TABLES}" == "true" || "${RPC_PROBE}" == "true" ]]; then
   echo "## OpenAPI discovery"
   if discover_from_openapi; then
     discovered_tables_count="$(wc -l < "${DISCOVERED_TABLES_FILE}" | xargs)"
@@ -135,7 +274,7 @@ if [[ "${AUTO_TABLES}" == "true" ]]; then
     echo "Discovered tables/views: ${discovered_tables_count}"
     echo "Discovered rpc endpoints: ${discovered_rpc_count}"
 
-    if [[ -n "${TABLES_FILE}" ]]; then
+    if [[ "${AUTO_TABLES}" == "true" && -n "${TABLES_FILE}" ]]; then
       COMBINED_TABLES_FILE="$(mktemp)"
       awk '
         { sub(/#.*/, "", $0); gsub(/^[ \t]+|[ \t]+$/, "", $0); if ($0 != "") print $0 }
@@ -143,7 +282,7 @@ if [[ "${AUTO_TABLES}" == "true" ]]; then
         | sort -u > "${COMBINED_TABLES_FILE}"
       ACTIVE_TABLES_FILE="${COMBINED_TABLES_FILE}"
       echo "Merged table targets: file + OpenAPI"
-    else
+    elif [[ "${AUTO_TABLES}" == "true" ]]; then
       ACTIVE_TABLES_FILE="${DISCOVERED_TABLES_FILE}"
       echo "Using OpenAPI-discovered table targets"
     fi
@@ -159,11 +298,13 @@ if [[ "${AUTO_TABLES}" == "true" ]]; then
     fi
   else
     echo "Could not read OpenAPI from /rest/v1/ (auth blocked or not exposed)."
-    if [[ -z "${TABLES_FILE}" ]]; then
+    if [[ "${AUTO_TABLES}" == "true" && -z "${TABLES_FILE}" ]]; then
       echo "Auto discovery failed and no --tables file was provided." >&2
       exit 1
     fi
-    echo "Falling back to --tables only."
+    if [[ "${AUTO_TABLES}" == "true" ]]; then
+      echo "Falling back to --tables only."
+    fi
   fi
   echo
 fi
@@ -174,8 +315,17 @@ echo "Tables file input: ${TABLES_FILE:-<none>}"
 echo "Tables target source: ${ACTIVE_TABLES_FILE}"
 echo "Auto tables: ${AUTO_TABLES}"
 echo "No-auth probe: ${NOAUTH_PROBE}"
+echo "Auth matrix: ${AUTH_MATRIX}"
+echo "User JWT provided: $( [[ -n "${SUPABASE_USER_JWT}" ]] && echo yes || echo no )"
+echo "RPC probe: ${RPC_PROBE}"
+echo "PATCH/DELETE probe: ${PATCH_DELETE_PROBE}"
+echo "Mutation filter: ${MUTATION_FILTER}"
+echo "Storage probe: ${STORAGE_PROBE}"
 echo "Sensitive regex: ${SENSITIVE_REGEX}"
 echo "Write probe: ${WRITE_PROBE}"
+if [[ "${AUTH_MATRIX}" == "true" && -z "${SUPABASE_USER_JWT}" ]]; then
+  echo "Note: --auth-matrix enabled without --user-jwt (user= N/A)."
+fi
 echo
 
 # Auth settings (best-effort)
@@ -190,11 +340,51 @@ echo
 
 # Storage buckets (best-effort)
 echo "## Storage buckets"
-if curl -fsS "${auth_headers[@]}" "${SUPABASE_URL}/storage/v1/bucket" | jq . >/dev/null 2>&1; then
-  curl -fsS "${auth_headers[@]}" "${SUPABASE_URL}/storage/v1/bucket" \
-    | jq 'map({id,name,public,created_at})'
+bucket_headers="$(mktemp)"
+bucket_body="$(mktemp)"
+bucket_http="$(
+  curl -sS -D "${bucket_headers}" -o "${bucket_body}" -w "%{http_code}" \
+    "${auth_headers[@]}" \
+    "${SUPABASE_URL}/storage/v1/bucket" || true
+)"
+
+if [[ "${bucket_http}" == "200" ]] && jq -e . "${bucket_body}" >/dev/null 2>&1; then
+  cat "${bucket_body}" | jq 'map({id,name,public,created_at})'
+  cat "${bucket_body}" | jq -r '.[]?.id // empty' | sort -u > "${DISCOVERED_BUCKETS_FILE}"
+  public_buckets="$(cat "${bucket_body}" | jq -r '.[]? | select(.public==true) | .id' || true)"
+  if [[ -n "${public_buckets}" ]]; then
+    echo "⚠ Public buckets:"
+    echo "${public_buckets}" | sed 's/^/  - /'
+  fi
 else
   echo "Could not list buckets (may be blocked)."
+fi
+rm -f "${bucket_headers}" "${bucket_body}"
+echo
+
+if [[ "${STORAGE_PROBE}" == "true" ]]; then
+  echo "## Storage object/list probe"
+  if [[ -s "${DISCOVERED_BUCKETS_FILE}" ]]; then
+    while IFS= read -r bucket; do
+      [[ -z "${bucket}" ]] && continue
+      echo "-- ${bucket}"
+      if [[ "${AUTH_MATRIX}" == "true" ]]; then
+        s_noauth="$(mode_storage_list_status "noauth" "${bucket}")"
+        s_anon="$(mode_storage_list_status "anon" "${bucket}")"
+        s_user="$(mode_storage_list_status "user" "${bucket}")"
+        echo "  LIST status matrix: noauth=${s_noauth} anon=${s_anon} user=${s_user}"
+      else
+        s_anon="$(mode_storage_list_status "anon" "${bucket}")"
+        echo "  LIST status (anon): ${s_anon}"
+        if [[ "${NOAUTH_PROBE}" == "true" ]]; then
+          s_noauth="$(mode_storage_list_status "noauth" "${bucket}")"
+          echo "  LIST status (noauth): ${s_noauth}"
+        fi
+      fi
+    done < "${DISCOVERED_BUCKETS_FILE}"
+  else
+    echo "No buckets discovered; skip storage probe."
+  fi
 fi
 echo
 
@@ -225,15 +415,18 @@ while IFS= read -r table; do
 
   echo "-- ${table}"
 
-  if [[ "${NOAUTH_PROBE}" == "true" ]]; then
-    noauth_code="$(
-      curl -sS -o /dev/null -w "%{http_code}" \
-        -H "Range: 0-0" \
-        -H "Prefer: count=exact" \
-        "${SUPABASE_URL}/rest/v1/${table}?select=*&limit=1" || true
-    )"
-    echo "  NOAUTH READ status: ${noauth_code}"
-    if [[ "${noauth_code}" == "200" ]]; then
+  if [[ "${AUTH_MATRIX}" == "true" ]]; then
+    read_noauth="$(mode_read_status "noauth" "${table}")"
+    read_anon="$(mode_read_status "anon" "${table}")"
+    read_user="$(mode_read_status "user" "${table}")"
+    echo "  READ status matrix: noauth=${read_noauth} anon=${read_anon} user=${read_user}"
+    if [[ "${read_noauth}" == "200" ]]; then
+      echo "  ⚠ NOAUTHで読み取り可能です (apikey/Authorization なし)"
+    fi
+  elif [[ "${NOAUTH_PROBE}" == "true" ]]; then
+    read_noauth="$(mode_read_status "noauth" "${table}")"
+    echo "  NOAUTH READ status: ${read_noauth}"
+    if [[ "${read_noauth}" == "200" ]]; then
       echo "  ⚠ NOAUTHで読み取り可能です (apikey/Authorization なし)"
     fi
   fi
@@ -284,6 +477,31 @@ while IFS= read -r table; do
 
   rm -f "${resp_headers}" "${resp_body}"
 
+  if [[ "${PATCH_DELETE_PROBE}" == "true" ]]; then
+    echo "  PATCH/DELETE probe (safe-ish): filter=${MUTATION_FILTER}"
+    if [[ "${AUTH_MATRIX}" == "true" ]]; then
+      p_noauth="$(mode_mutation_status "noauth" "PATCH" "${table}" "${MUTATION_FILTER}")"
+      p_anon="$(mode_mutation_status "anon" "PATCH" "${table}" "${MUTATION_FILTER}")"
+      p_user="$(mode_mutation_status "user" "PATCH" "${table}" "${MUTATION_FILTER}")"
+      d_noauth="$(mode_mutation_status "noauth" "DELETE" "${table}" "${MUTATION_FILTER}")"
+      d_anon="$(mode_mutation_status "anon" "DELETE" "${table}" "${MUTATION_FILTER}")"
+      d_user="$(mode_mutation_status "user" "DELETE" "${table}" "${MUTATION_FILTER}")"
+      echo "    PATCH status matrix: noauth=${p_noauth} anon=${p_anon} user=${p_user}"
+      echo "    DELETE status matrix: noauth=${d_noauth} anon=${d_anon} user=${d_user}"
+    else
+      p_anon="$(mode_mutation_status "anon" "PATCH" "${table}" "${MUTATION_FILTER}")"
+      d_anon="$(mode_mutation_status "anon" "DELETE" "${table}" "${MUTATION_FILTER}")"
+      echo "    PATCH status (anon): ${p_anon}"
+      echo "    DELETE status (anon): ${d_anon}"
+      if [[ "${NOAUTH_PROBE}" == "true" ]]; then
+        p_noauth="$(mode_mutation_status "noauth" "PATCH" "${table}" "${MUTATION_FILTER}")"
+        d_noauth="$(mode_mutation_status "noauth" "DELETE" "${table}" "${MUTATION_FILTER}")"
+        echo "    PATCH status (noauth): ${p_noauth}"
+        echo "    DELETE status (noauth): ${d_noauth}"
+      fi
+    fi
+  fi
+
   # Optional write probe: SAFE-ish mode only (Prefer: return=minimal + {}), still risky.
   if [[ "${WRITE_PROBE}" == "true" ]]; then
     echo "  WRITE probe (dangerous): attempting POST {} with return=minimal"
@@ -306,5 +524,31 @@ while IFS= read -r table; do
 
   echo
 done < "${ACTIVE_TABLES_FILE}"
+
+if [[ "${RPC_PROBE}" == "true" ]]; then
+  echo "## RPC probes"
+  if [[ -s "${DISCOVERED_RPC_FILE}" ]]; then
+    while IFS= read -r rpc; do
+      [[ -z "${rpc}" ]] && continue
+      echo "-- ${rpc}"
+      if [[ "${AUTH_MATRIX}" == "true" ]]; then
+        r_noauth="$(mode_rpc_status "noauth" "${rpc}")"
+        r_anon="$(mode_rpc_status "anon" "${rpc}")"
+        r_user="$(mode_rpc_status "user" "${rpc}")"
+        echo "  RPC status matrix: noauth=${r_noauth} anon=${r_anon} user=${r_user}"
+      else
+        r_anon="$(mode_rpc_status "anon" "${rpc}")"
+        echo "  RPC status (anon): ${r_anon}"
+        if [[ "${NOAUTH_PROBE}" == "true" ]]; then
+          r_noauth="$(mode_rpc_status "noauth" "${rpc}")"
+          echo "  RPC status (noauth): ${r_noauth}"
+        fi
+      fi
+    done < "${DISCOVERED_RPC_FILE}"
+  else
+    echo "No RPC discovered; skip RPC probe."
+  fi
+  echo
+fi
 
 echo "Done."
