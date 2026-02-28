@@ -53,20 +53,29 @@ STRICT_MODE=false
 REPORT_JSON_FILE=""
 REPORT_JSON_ENABLED=false
 
+require_option_value() {
+  local opt="$1"
+  local val="${2:-}"
+  if [[ -z "${val}" || "${val}" == --* ]]; then
+    echo "${opt} requires a value" >&2
+    exit 1
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --tables) TABLES_FILE="${2:-}"; shift 2 ;;
-    --url) ARG_URL="${2:-}"; shift 2 ;;
-    --anon) ARG_ANON="${2:-}"; shift 2 ;;
-    --user-jwt) ARG_USER_JWT="${2:-}"; shift 2 ;;
-    --sensitive) ARG_SENSITIVE="${2:-}"; shift 2 ;;
+    --tables) require_option_value "$1" "${2:-}"; TABLES_FILE="${2}"; shift 2 ;;
+    --url) require_option_value "$1" "${2:-}"; ARG_URL="${2}"; shift 2 ;;
+    --anon) require_option_value "$1" "${2:-}"; ARG_ANON="${2}"; shift 2 ;;
+    --user-jwt) require_option_value "$1" "${2:-}"; ARG_USER_JWT="${2}"; shift 2 ;;
+    --sensitive) require_option_value "$1" "${2:-}"; ARG_SENSITIVE="${2}"; shift 2 ;;
     --auto-tables) AUTO_TABLES=true; shift ;;
     --noauth-probe) NOAUTH_PROBE=true; shift ;;
     --auth-matrix) AUTH_MATRIX=true; shift ;;
     --rpc-probe) RPC_PROBE=true; shift ;;
     --storage-probe) STORAGE_PROBE=true; shift ;;
     --strict) STRICT_MODE=true; shift ;;
-    --report-json) REPORT_JSON_ENABLED=true; REPORT_JSON_FILE="${2:-}"; shift 2 ;;
+    --report-json) require_option_value "$1" "${2:-}"; REPORT_JSON_ENABLED=true; REPORT_JSON_FILE="${2}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 1 ;;
   esac
@@ -75,6 +84,8 @@ done
 SUPABASE_URL="${ARG_URL:-${SUPABASE_URL:-}}"
 SUPABASE_ANON_KEY="${ARG_ANON:-${SUPABASE_ANON_KEY:-}}"
 SUPABASE_USER_JWT="${ARG_USER_JWT:-${SUPABASE_USER_JWT:-}}"
+USER_JWT_PROVIDED=false
+[[ -n "${SUPABASE_USER_JWT}" ]] && USER_JWT_PROVIDED=true
 SENSITIVE_REGEX="${ARG_SENSITIVE:-${SENSITIVE_REGEX:-"(email|password|pass|phone|tel|ssn|credit|card|token|secret|address|birth|birthday|salary|ip)"}}"
 
 if [[ -n "${TABLES_FILE}" && ! -f "${TABLES_FILE}" ]]; then
@@ -119,10 +130,16 @@ if [[ -n "${SUPABASE_USER_JWT}" ]]; then
   )
 fi
 
-mode_read_status() {
+request_status_with_mode() {
   local mode="$1"
-  local table="$2"
-  local -a headers=()
+  local method="$2"
+  local url="$3"
+  local body="${4:-}"
+  local content_type="${5:-}"
+  local header1="${6:-}"
+  local header2="${7:-}"
+  local -a headers=() curl_args=()
+
   case "${mode}" in
     noauth) ;;
     anon) headers=("${auth_headers[@]}") ;;
@@ -136,61 +153,52 @@ mode_read_status() {
     *) echo "N/A"; return 0 ;;
   esac
 
-  curl -sS -o /dev/null -w "%{http_code}" \
-    "${headers[@]}" \
-    -H "Range: 0-0" \
-    -H "Prefer: count=exact" \
-    "${SUPABASE_URL}/rest/v1/${table}?select=*&limit=1" || true
+  curl_args=(-sS -o /dev/null -w "%{http_code}")
+  if [[ "${#headers[@]}" -gt 0 ]]; then
+    curl_args+=("${headers[@]}")
+  fi
+  [[ -n "${content_type}" ]] && curl_args+=(-H "Content-Type: ${content_type}")
+  [[ -n "${header1}" ]] && curl_args+=(-H "${header1}")
+  [[ -n "${header2}" ]] && curl_args+=(-H "${header2}")
+  [[ "${method}" != "GET" ]] && curl_args+=(-X "${method}")
+  [[ -n "${body}" ]] && curl_args+=(--data "${body}")
+
+  curl "${curl_args[@]}" "${url}" || true
+}
+
+mode_read_status() {
+  local mode="$1"
+  local table="$2"
+  request_status_with_mode \
+    "${mode}" \
+    "GET" \
+    "${SUPABASE_URL}/rest/v1/${table}?select=*&limit=1" \
+    "" \
+    "" \
+    "Range: 0-0" \
+    "Prefer: count=exact"
 }
 
 mode_rpc_status() {
   local mode="$1"
   local rpc="$2"
-  local -a headers=()
-  case "${mode}" in
-    noauth) ;;
-    anon) headers=("${auth_headers[@]}") ;;
-    user)
-      if [[ -z "${SUPABASE_USER_JWT}" ]]; then
-        echo "N/A"
-        return 0
-      fi
-      headers=("${user_headers[@]}")
-      ;;
-    *) echo "N/A"; return 0 ;;
-  esac
-
-  curl -sS -o /dev/null -w "%{http_code}" \
-    "${headers[@]}" \
-    -H "Content-Type: application/json" \
-    -X POST \
-    --data '{}' \
-    "${SUPABASE_URL}/rest/v1/rpc/${rpc}" || true
+  request_status_with_mode \
+    "${mode}" \
+    "POST" \
+    "${SUPABASE_URL}/rest/v1/rpc/${rpc}" \
+    "{}" \
+    "application/json"
 }
 
 mode_storage_list_status() {
   local mode="$1"
   local bucket="$2"
-  local -a headers=()
-  case "${mode}" in
-    noauth) ;;
-    anon) headers=("${auth_headers[@]}") ;;
-    user)
-      if [[ -z "${SUPABASE_USER_JWT}" ]]; then
-        echo "N/A"
-        return 0
-      fi
-      headers=("${user_headers[@]}")
-      ;;
-    *) echo "N/A"; return 0 ;;
-  esac
-
-  curl -sS -o /dev/null -w "%{http_code}" \
-    "${headers[@]}" \
-    -H "Content-Type: application/json" \
-    -X POST \
-    --data '{"limit":1,"offset":0}' \
-    "${SUPABASE_URL}/storage/v1/object/list/${bucket}" || true
+  request_status_with_mode \
+    "${mode}" \
+    "POST" \
+    "${SUPABASE_URL}/storage/v1/object/list/${bucket}" \
+    '{"limit":1,"offset":0}' \
+    "application/json"
 }
 
 DISCOVERED_TABLES_FILE="$(mktemp)"
@@ -216,6 +224,56 @@ add_finding() {
 is_success_code() {
   local code="$1"
   [[ "${code}" =~ ^2[0-9][0-9]$ ]]
+}
+
+probe_access() {
+  local probe_fn="$1"
+  local target="$2"
+  local label="$3"
+  local category="$4"
+  local high_message="$5"
+  local medium_message="$6"
+  local probe_anon_without_matrix="${7:-true}"
+  local noauth_warning="${8:-}"
+  local noauth_label_override="${9:-}"
+  local code_noauth="" code_anon="" code_user=""
+
+  if [[ "${AUTH_MATRIX}" == "true" ]]; then
+    code_noauth="$("${probe_fn}" "noauth" "${target}")"
+    code_anon="$("${probe_fn}" "anon" "${target}")"
+    code_user="$("${probe_fn}" "user" "${target}")"
+    echo "  ${label} status matrix: noauth=${code_noauth} anon=${code_anon} user=${code_user}"
+
+    if is_success_code "${code_noauth}"; then
+      [[ -n "${noauth_warning}" ]] && echo "  ${noauth_warning}"
+      add_finding "high" "${category}" "${target}" "${high_message}"
+    fi
+    if is_success_code "${code_anon}"; then
+      add_finding "medium" "${category}" "${target}" "${medium_message}"
+    fi
+    return 0
+  fi
+
+  if [[ "${probe_anon_without_matrix}" == "true" ]]; then
+    code_anon="$("${probe_fn}" "anon" "${target}")"
+    echo "  ${label} status (anon): ${code_anon}"
+    if is_success_code "${code_anon}"; then
+      add_finding "medium" "${category}" "${target}" "${medium_message}"
+    fi
+  fi
+
+  if [[ "${NOAUTH_PROBE}" == "true" ]]; then
+    code_noauth="$("${probe_fn}" "noauth" "${target}")"
+    if [[ -n "${noauth_label_override}" ]]; then
+      echo "  ${noauth_label_override}: ${code_noauth}"
+    else
+      echo "  ${label} status (noauth): ${code_noauth}"
+    fi
+    if is_success_code "${code_noauth}"; then
+      [[ -n "${noauth_warning}" ]] && echo "  ${noauth_warning}"
+      add_finding "high" "${category}" "${target}" "${high_message}"
+    fi
+  fi
 }
 
 cleanup() {
@@ -314,13 +372,13 @@ echo "Tables target source: ${ACTIVE_TABLES_FILE}"
 echo "Auto tables: ${AUTO_TABLES}"
 echo "No-auth probe: ${NOAUTH_PROBE}"
 echo "Auth matrix: ${AUTH_MATRIX}"
-echo "User JWT provided: $( [[ -n "${SUPABASE_USER_JWT}" ]] && echo yes || echo no )"
+echo "User JWT provided: $( [[ "${USER_JWT_PROVIDED}" == "true" ]] && echo yes || echo no )"
 echo "RPC probe: ${RPC_PROBE}"
 echo "Storage probe: ${STORAGE_PROBE}"
 echo "Strict mode: ${STRICT_MODE}"
 echo "Report JSON: ${REPORT_JSON_FILE:-<none>}"
 echo "Sensitive regex: ${SENSITIVE_REGEX}"
-if [[ "${AUTH_MATRIX}" == "true" && -z "${SUPABASE_USER_JWT}" ]]; then
+if [[ "${AUTH_MATRIX}" == "true" && "${USER_JWT_PROVIDED}" != "true" ]]; then
   echo "Note: --auth-matrix enabled without --user-jwt (user= N/A)."
 fi
 echo
@@ -346,9 +404,9 @@ bucket_http="$(
 )"
 
 if [[ "${bucket_http}" == "200" ]] && jq -e . "${bucket_body}" >/dev/null 2>&1; then
-  cat "${bucket_body}" | jq 'map({id,name,public,created_at})'
-  cat "${bucket_body}" | jq -r '.[]?.id // empty' | sort -u > "${DISCOVERED_BUCKETS_FILE}"
-  public_buckets="$(cat "${bucket_body}" | jq -r '.[]? | select(.public==true) | .id' || true)"
+  jq 'map({id,name,public,created_at})' "${bucket_body}"
+  jq -r '.[]?.id // empty' "${bucket_body}" | sort -u > "${DISCOVERED_BUCKETS_FILE}"
+  public_buckets="$(jq -r '.[]? | select(.public==true) | .id' "${bucket_body}" || true)"
   if [[ -n "${public_buckets}" ]]; then
     echo "⚠ Public buckets:"
     echo "${public_buckets}" | sed 's/^/  - /'
@@ -369,31 +427,14 @@ if [[ "${STORAGE_PROBE}" == "true" ]]; then
     while IFS= read -r bucket; do
       [[ -z "${bucket}" ]] && continue
       echo "-- ${bucket}"
-      if [[ "${AUTH_MATRIX}" == "true" ]]; then
-        s_noauth="$(mode_storage_list_status "noauth" "${bucket}")"
-        s_anon="$(mode_storage_list_status "anon" "${bucket}")"
-        s_user="$(mode_storage_list_status "user" "${bucket}")"
-        echo "  LIST status matrix: noauth=${s_noauth} anon=${s_anon} user=${s_user}"
-        if is_success_code "${s_noauth}"; then
-          add_finding "high" "storage_list" "${bucket}" "Storage list endpoint is accessible without auth"
-        fi
-        if is_success_code "${s_anon}"; then
-          add_finding "medium" "storage_list" "${bucket}" "Storage list endpoint is accessible with anon key"
-        fi
-      else
-        s_anon="$(mode_storage_list_status "anon" "${bucket}")"
-        echo "  LIST status (anon): ${s_anon}"
-        if is_success_code "${s_anon}"; then
-          add_finding "medium" "storage_list" "${bucket}" "Storage list endpoint is accessible with anon key"
-        fi
-        if [[ "${NOAUTH_PROBE}" == "true" ]]; then
-          s_noauth="$(mode_storage_list_status "noauth" "${bucket}")"
-          echo "  LIST status (noauth): ${s_noauth}"
-          if is_success_code "${s_noauth}"; then
-            add_finding "high" "storage_list" "${bucket}" "Storage list endpoint is accessible without auth"
-          fi
-        fi
-      fi
+      probe_access \
+        "mode_storage_list_status" \
+        "${bucket}" \
+        "LIST" \
+        "storage_list" \
+        "Storage list endpoint is accessible without auth" \
+        "Storage list endpoint is accessible with anon key" \
+        "true"
     done < "${DISCOVERED_BUCKETS_FILE}"
   else
     echo "No buckets discovered; skip storage probe."
@@ -428,26 +469,16 @@ while IFS= read -r table; do
 
   echo "-- ${table}"
 
-  if [[ "${AUTH_MATRIX}" == "true" ]]; then
-    read_noauth="$(mode_read_status "noauth" "${table}")"
-    read_anon="$(mode_read_status "anon" "${table}")"
-    read_user="$(mode_read_status "user" "${table}")"
-    echo "  READ status matrix: noauth=${read_noauth} anon=${read_anon} user=${read_user}"
-    if [[ "${read_noauth}" == "200" ]]; then
-      echo "  ⚠ NOAUTHで読み取り可能です (apikey/Authorization なし)"
-      add_finding "high" "table_read" "${table}" "Table read is accessible without auth"
-    fi
-    if [[ "${read_anon}" == "200" ]]; then
-      add_finding "medium" "table_read" "${table}" "Table read is accessible with anon key"
-    fi
-  elif [[ "${NOAUTH_PROBE}" == "true" ]]; then
-    read_noauth="$(mode_read_status "noauth" "${table}")"
-    echo "  NOAUTH READ status: ${read_noauth}"
-    if [[ "${read_noauth}" == "200" ]]; then
-      echo "  ⚠ NOAUTHで読み取り可能です (apikey/Authorization なし)"
-      add_finding "high" "table_read" "${table}" "Table read is accessible without auth"
-    fi
-  fi
+  probe_access \
+    "mode_read_status" \
+    "${table}" \
+    "READ" \
+    "table_read" \
+    "Table read is accessible without auth" \
+    "Table read is accessible with anon key" \
+    "false" \
+    "⚠ NOAUTHで読み取り可能です (apikey/Authorization なし)" \
+    "NOAUTH READ status"
 
   resp_headers="$(mktemp)"
   resp_body="$(mktemp)"
@@ -467,11 +498,11 @@ while IFS= read -r table; do
 
   if [[ "${http_code}" == "200" ]]; then
     if jq -e . "${resp_body}" >/dev/null 2>&1; then
-      keys="$(cat "${resp_body}" | extract_keys | tr '\n' ' ' || true)"
+      keys="$(extract_keys < "${resp_body}" | tr '\n' ' ' || true)"
       [[ -n "$keys" ]] && echo "  Keys(sample): ${keys}"
 
       # detect sensitive keys
-      sensitive_keys="$(cat "${resp_body}" | extract_keys | grep -Ei "${SENSITIVE_REGEX}" || true)"
+      sensitive_keys="$(extract_keys < "${resp_body}" | grep -Ei "${SENSITIVE_REGEX}" || true)"
       if [[ -n "$sensitive_keys" ]]; then
         echo "  ⚠ Sensitive-like keys found:"
         echo "$sensitive_keys" | sed 's/^/    - /'
@@ -493,7 +524,7 @@ while IFS= read -r table; do
   elif [[ "${http_code}" == "401" || "${http_code}" == "403" ]]; then
     echo "  READ blocked (good if intended)"
   else
-    err="$(cat "${resp_body}" | head -c 400 | tr '\n' ' ' || true)"
+    err="$(head -c 400 "${resp_body}" | tr '\n' ' ' || true)"
     [[ -n "$err" ]] && echo "  RESP: ${err}"
   fi
 
@@ -508,31 +539,14 @@ if [[ "${RPC_PROBE}" == "true" ]]; then
     while IFS= read -r rpc; do
       [[ -z "${rpc}" ]] && continue
       echo "-- ${rpc}"
-      if [[ "${AUTH_MATRIX}" == "true" ]]; then
-        r_noauth="$(mode_rpc_status "noauth" "${rpc}")"
-        r_anon="$(mode_rpc_status "anon" "${rpc}")"
-        r_user="$(mode_rpc_status "user" "${rpc}")"
-        echo "  RPC status matrix: noauth=${r_noauth} anon=${r_anon} user=${r_user}"
-        if is_success_code "${r_noauth}"; then
-          add_finding "high" "rpc_exec" "${rpc}" "RPC appears callable without auth"
-        fi
-        if is_success_code "${r_anon}"; then
-          add_finding "medium" "rpc_exec" "${rpc}" "RPC appears callable with anon key"
-        fi
-      else
-        r_anon="$(mode_rpc_status "anon" "${rpc}")"
-        echo "  RPC status (anon): ${r_anon}"
-        if is_success_code "${r_anon}"; then
-          add_finding "medium" "rpc_exec" "${rpc}" "RPC appears callable with anon key"
-        fi
-        if [[ "${NOAUTH_PROBE}" == "true" ]]; then
-          r_noauth="$(mode_rpc_status "noauth" "${rpc}")"
-          echo "  RPC status (noauth): ${r_noauth}"
-          if is_success_code "${r_noauth}"; then
-            add_finding "high" "rpc_exec" "${rpc}" "RPC appears callable without auth"
-          fi
-        fi
-      fi
+      probe_access \
+        "mode_rpc_status" \
+        "${rpc}" \
+        "RPC" \
+        "rpc_exec" \
+        "RPC appears callable without auth" \
+        "RPC appears callable with anon key" \
+        "true"
     done < "${DISCOVERED_RPC_FILE}"
   else
     echo "No RPC discovered; skip RPC probe."
@@ -558,13 +572,13 @@ if [[ "${REPORT_JSON_ENABLED}" == "true" ]]; then
     --arg url "${SUPABASE_URL}" \
     --arg tables_file "${TABLES_FILE}" \
     --arg tables_target "${ACTIVE_TABLES_FILE}" \
-    --arg auto_tables "${AUTO_TABLES}" \
-    --arg noauth_probe "${NOAUTH_PROBE}" \
-    --arg auth_matrix "${AUTH_MATRIX}" \
-    --arg rpc_probe "${RPC_PROBE}" \
-    --arg storage_probe "${STORAGE_PROBE}" \
-    --arg strict_mode "${STRICT_MODE}" \
-    --arg user_jwt_provided "$( [[ -n "${SUPABASE_USER_JWT}" ]] && echo yes || echo no )" \
+    --argjson auto_tables "${AUTO_TABLES}" \
+    --argjson noauth_probe "${NOAUTH_PROBE}" \
+    --argjson auth_matrix "${AUTH_MATRIX}" \
+    --argjson rpc_probe "${RPC_PROBE}" \
+    --argjson storage_probe "${STORAGE_PROBE}" \
+    --argjson strict_mode "${STRICT_MODE}" \
+    --argjson user_jwt_provided "${USER_JWT_PROVIDED}" \
     --argjson total "${total_findings}" \
     --argjson high "${high_findings}" \
     --argjson medium "${medium_findings}" \
