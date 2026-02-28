@@ -9,3 +9,8 @@ SUPABASE_URL=https://XXX.supabase.co SUPABASE_ANON_KEY=XXX ./sb-audit.sh --table
 # Extended audit (auth matrix + rpc + mutation + storage)
 # SUPABASE_URL=https://XXX.supabase.co SUPABASE_ANON_KEY=XXX SUPABASE_USER_JWT=XXX \
 #   ./sb-audit.sh --auto-tables --auth-matrix --rpc-probe --patch-delete-probe --storage-probe
+
+# CI-friendly (fail on high findings + JSON output)
+# SUPABASE_URL=https://XXX.supabase.co SUPABASE_ANON_KEY=XXX SUPABASE_USER_JWT=XXX \
+#   ./sb-audit.sh --auto-tables --auth-matrix --rpc-probe --patch-delete-probe --storage-probe \
+#   --strict --report-json report.json
